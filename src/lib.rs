@@ -206,7 +206,7 @@ mod node;
 // mod query_parser;
 // mod v1_parser;
 mod value;
-
+mod parser;
 mod v2_parser;
 
 #[cfg(feature = "serde")]
