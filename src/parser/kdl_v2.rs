@@ -2,36 +2,23 @@
 #![allow(unused)]
 #![allow(unreachable_pub)]
 
-use std::{
-    cell::Cell,
-    fmt, iter, mem,
-    num::{ParseFloatError, ParseIntError},
-    ops::Range,
-    slice,
-    str::Chars,
-};
+use std::{fmt, iter, mem, ops::Range, slice};
 
 use miette::{Severity, SourceSpan};
 use winnow::{
-    LocatingSlice, Parser, RecoverableParser,
-    ascii::escaped,
-    combinator::{
-        alt, cut_err, delimited, dispatch, empty, eof, fail, iterator, not, opt, peek, repeat,
-        separated, seq, todo, trace,
-    },
-    error::{
-        AddContext, ContextError, ErrMode, FromExternalError, FromRecoverableError, Needed,
-        ParserError,
-    },
-    stream::{
-        Accumulate, AsChar, ContainsToken, Location, Offset, Recoverable, Stream, StreamIsPartial,
-    },
-    token::{any, literal, none_of, one_of, take_while},
+    Parser,
+    combinator::{alt, cut_err, delimited, dispatch, eof, fail, opt, repeat, trace},
+    error::{FromRecoverableError, Needed, ParserError},
+    stream::{Accumulate, ContainsToken, Location, Offset, Recover, Stream, StreamIsPartial},
+    token::{any, one_of},
 };
 
 use crate::{
     KdlDocument, KdlEntry, KdlIdentifier, KdlNode, KdlNodeFormat, KdlValue,
-    parser::{KdlParseError, PError, PResult, TextLocation, TraceExt, cursor::Cursor, cx},
+    parser::{
+        KdlParseError, PError, PResult, SubtokenParse, TextLocation, TraceExt, cursor::Cursor, cx,
+        failure_from_errs,
+    },
 };
 
 // IMPORTANT
@@ -164,6 +151,7 @@ pub struct TokenStream<'src> {
     slice: &'src [Token<'src>],
     initial: &'src [Token<'src>],
     text: &'src str,
+    errors: Vec<KdlParseError>,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -176,6 +164,15 @@ impl<'src> Offset for Checkpoint<'src> {
 }
 
 impl<'src> TokenStream<'src> {
+    fn new(tokens: &'src [Token<'src>], text: &'src str) -> Self {
+        Self {
+            slice: tokens,
+            initial: tokens,
+            text,
+            errors: Vec::new(),
+        }
+    }
+
     fn token_slice_to_str(&self, subslice: &'src [Token<'src>]) -> &'src str {
         if subslice.is_empty() {
             // Sort of awkward. Find the index where the empty subslice should be,
@@ -274,6 +271,30 @@ impl<'src> Stream for TokenStream<'src> {
     }
 }
 
+impl<'src, E: ParserError<Self>> Recover<E> for TokenStream<'src>
+where
+    KdlParseError: FromRecoverableError<Self, E>,
+{
+    fn record_err(
+        &mut self,
+        token_start: &Self::Checkpoint,
+        err_start: &Self::Checkpoint,
+        mut err: E,
+    ) -> Result<(), E> {
+        self.errors.push(KdlParseError::from_recoverable_error(
+            token_start,
+            err_start,
+            &*self,
+            err,
+        ));
+        Ok(())
+    }
+
+    fn is_recovery_supported() -> bool {
+        true
+    }
+}
+
 impl<'src> StreamIsPartial for TokenStream<'src> {
     type PartialState = ();
 
@@ -319,7 +340,7 @@ static NEWLINES: [&str; 8] = [
 ];
 
 static NEWLINES_AND_SPACES: &str = concat!(
-    "\u{0009}\u{0002}\u{00A0}\u{1680}\u{2000}\u{2001}\u{2002}\u{2003}",
+    "\u{0009}\u{0020}\u{00A0}\u{1680}\u{2000}\u{2001}\u{2002}\u{2003}",
     "\u{2004}\u{2005}\u{2006}\u{2007}\u{2008}\u{2009}\u{200A}\u{202F}",
     "\u{205F}\u{3000}",
     "\u{000D}\u{000A}\u{0085}\u{000B}\u{000C}\u{2028}\u{2029}",
@@ -380,14 +401,12 @@ impl<'src> Accumulate<AccEntry<'src, KdlNode>> for KdlDocumentAcc {
 }
 
 pub fn document(input: &mut TokenStream<'_>) -> PResult<KdlDocument> {
+    let _start = input.checkpoint();
     let bom = opt(Bom).parse_next(input)?;
-    let (mut doc, _span) = nodes
-        .map(KdlDocumentAcc::finish)
-        .with_span()
-        .parse_next(input)?;
+    let mut doc = nodes.map(KdlDocumentAcc::finish).parse_next(input)?;
     #[cfg(feature = "span")]
     {
-        doc.span = _span.into();
+        doc.span = input.span_from_checkpoint(&_start).into();
     }
     if let Some((fmt, bom)) = doc.format_mut().zip(bom) {
         fmt.leading = format!("{bom}{}", fmt.leading);
@@ -396,8 +415,8 @@ pub fn document(input: &mut TokenStream<'_>) -> PResult<KdlDocument> {
 }
 
 #[test]
-fn idk() {
-    let text = "test #null /-{} {} /-{}";
+fn idk() -> miette::Result<()> {
+    let text = r#""aa\u{}\u{q}\u{D800}\u{1234567}\ { test; test }"#;
     let mut start = 0;
     let mut tk = |kind: TokenKind, len: usize| {
         let span = start..(start + len);
@@ -405,29 +424,28 @@ fn idk() {
         Token::new(kind, text, span)
     };
     let tokens = &[
-        tk(QuotedString, 4),
-        // tk(IdentString, 4),
-        // tk(Space, 1),
-        // tk(Null, 5),
-        // tk(Space, 1),
-        // tk(Slashdash, 2),
-        // tk(LCurly, 1),
-        // tk(RCurly, 1),
-        // tk(Space, 1),
-        // tk(LCurly, 1),
-        // tk(RCurly, 1),
-        // tk(Space, 1),
-        // tk(Slashdash, 2),
-        // tk(LCurly, 1),
-        // tk(RCurly, 1),
+        tk(QuotedString, 32),
+        tk(Space, 1),
+        tk(LCurly, 1),
+        tk(Space, 1),
+        tk(IdentString, 4),
+        tk(Semicolon, 1),
+        tk(Space, 1),
+        tk(IdentString, 4),
+        tk(Space, 1),
+        tk(RCurly, 1),
     ];
-    let mut stream = TokenStream {
-        slice: tokens,
-        initial: tokens,
-        text,
+    let mut stream = TokenStream::new(tokens, text);
+    let document = match document.parse_next(&mut stream) {
+        Ok(d) => d,
+        Err(e) => {
+            return Err(failure_from_errs(stream.errors, text).into());
+        }
     };
-    let document = document.parse(stream).unwrap();
-    println!("document:\n{}", document);
+    println!("{:?}", document.nodes[0].name.value());
+    println!("\ndocument:\n{}\n\noriginal:\n{}\n", document, text);
+
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -435,6 +453,32 @@ pub struct AccEntry<'src, T> {
     span: Range<TextOffset>,
     text: &'src str,
     kind: AccKind<T>,
+}
+
+impl<'src, T> AccEntry<'src, T> {
+    pub fn new_normal(text: &'src str, span: Range<TextOffset>, value: T) -> Self {
+        Self {
+            text,
+            span,
+            kind: AccKind::Normal(value),
+        }
+    }
+
+    pub fn new_slashdash(text: &'src str, span: Range<TextOffset>, value: T) -> Self {
+        Self {
+            text,
+            span,
+            kind: AccKind::Slashdash(value),
+        }
+    }
+
+    pub fn new_whitespace(text: &'src str, span: Range<TextOffset>) -> Self {
+        Self {
+            text,
+            span,
+            kind: AccKind::Whitespace,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -454,25 +498,90 @@ pub fn nodes<'src, A>(input: &mut TokenStream<'src>) -> PResult<A>
 where
     A: Accumulate<AccEntry<'src, KdlNode>>,
 {
-    repeat(
-        0..,
-        alt((
-            base_node.map(AccKind::Normal),
-            slashdashed(base_node).map(AccKind::Slashdash),
-            line_spaces.map(|_| AccKind::Whitespace),
-        ))
+    // This function is evil but everything is awkward otherwise.
+    let mut acc = A::initial(None);
+
+    /// Normal inter-node whitespace
+    let mut ws = opt(line_spaces)
+        .map(|_| AccKind::<KdlNode>::Whitespace)
         .with_span()
         .with_taken()
-        .map(AccEntry::from),
-    )
-    .trace("nodes")
-    .parse_next(input)
+        .map(AccEntry::from);
+    // A base node followed by maybe pre-terminator whitespace.
+    // The whitespace may be treated as trailing whitespace if
+    // there is no terminator to follow.
+    let mut nd = (
+        alt((
+            base_node
+                .with_span()
+                .with_taken()
+                .map(|((v, s), t)| (v, false, s, t)),
+            slashdashed(base_node)
+                .with_span()
+                .with_taken()
+                .map(|((v, s), t)| (v, true, s, t)),
+        )),
+        node_space0.span().with_taken(),
+    );
+
+    // Parse and commit an initial whitespace span
+    acc.accumulate(ws.parse_next(input)?);
+    // Now parse a node. Do not commit it until checks if there is a following terminator
+    let mut checkpoint = input.checkpoint();
+    let (mut node, mut trail) = nd.parse_next(input)?;
+    loop {
+        if let Some(term) = opt(node_terminator).parse_next(input)? {
+            let fmt = node.0.format_mut().unwrap();
+            fmt.before_terminator.push_str(trail.1);
+            fmt.terminator = term.into();
+            let span = input.span_from_checkpoint(&checkpoint);
+            let text = &input.text[span.clone()];
+            #[cfg(feature = "span")]
+            {
+                node.0.span = span.clone().into();
+            }
+            acc.accumulate(if node.1 {
+                AccEntry::new_slashdash(text, span, node.0)
+            } else {
+                AccEntry::new_normal(text, span, node.0)
+            });
+        } else {
+            // No terminator was parsed, so end the node iteration.
+            // This trailing whitespace should be sent to the accumulator
+            // instead of the parsed node.
+            acc.accumulate(if node.1 {
+                AccEntry::new_slashdash(node.3, node.2, node.0)
+            } else {
+                AccEntry::new_normal(node.3, node.2, node.0)
+            });
+            acc.accumulate(AccEntry::new_whitespace(trail.1, trail.0));
+            break;
+        }
+
+        // A node + terminator pair was just parsed and committed.
+        // All that remains is try to parse new lines spaces + a new node.
+        acc.accumulate(ws.parse_next(input)?);
+        // TODO: maybe instead of opt'ing this, actually check for }/eof?
+        if let Some((new_node, new_trail)) = opt(nd.by_ref()).parse_next(input)? {
+            node = new_node;
+            trail = new_trail;
+        } else {
+            break;
+        }
+    }
+
+    // TODO: Maybe parse another set of trailing whitespace? It will only matter when
+    // breaking due to not terminator, but if that happens, it *should* get eaten up
+    // by the node-spaces + terminator.
+
+    Ok(acc)
 }
 
-pub fn base_node(input: &mut TokenStream<'_>) -> PResult<KdlNode> {
+/// A node up until the terminator. Should not be called by anything else
+/// because the span and terminator data (which are logically part of the node)
+/// are not actually filled in yet.
+fn base_node(input: &mut TokenStream<'_>) -> PResult<KdlNode> {
     trace("base-node", |input: &mut TokenStream<'_>| {
-        let _start = input.checkpoint();
-
         let (before_ty_name, ty, after_ty_name) = opt(annotation)
             .parse_next(input)?
             .map(|(b, i, a)| (b, Some(i), a))
@@ -483,8 +592,6 @@ pub fn base_node(input: &mut TokenStream<'_>) -> PResult<KdlNode> {
 
         let (before_children, children, after_children) =
             children.map(KdlChildrenAcc::finish).parse_next(input)?;
-
-        let before_terminator = node_space0.take().parse_next(input)?;
 
         Ok(KdlNode {
             ty,
@@ -497,15 +604,21 @@ pub fn base_node(input: &mut TokenStream<'_>) -> PResult<KdlNode> {
                 after_ty_name: after_ty_name.into(),
                 after_ty: after_ty.into(),
                 before_children: format!("{}{}", after_entries, before_children),
-                before_terminator: before_terminator.into(),
+                before_terminator: after_children,
                 terminator: String::new(),
                 trailing: String::new(),
             }),
             #[cfg(feature = "span")]
-            span: input.span_from_checkpoint(&_start).into(),
+            span: (0..0).into(),
         })
     })
     .parse_next(input)
+}
+
+fn node_terminator<'src>(input: &mut TokenStream<'src>) -> PResult<&'src str> {
+    alt((line_terminator.void(), Semicolon.void()))
+        .take()
+        .parse_next(input)
 }
 
 pub fn identifier(input: &mut TokenStream<'_>) -> PResult<KdlIdentifier> {
@@ -711,17 +824,24 @@ where
 /// Specifically the { ... } bit. Children refers to a list of child_lists, slashdashed
 /// and unslashdashed
 pub fn braced_child_nodes(input: &mut TokenStream<'_>) -> PResult<KdlDocument> {
+    let _start = input.checkpoint();
     LCurly.parse_next(input)?;
+    let mut doc = nodes.map(KdlDocumentAcc::finish).parse_next(input)?;
     RCurly.parse_next(input)?;
-    Ok(KdlDocument::default())
+    #[cfg(feature = "span")]
+    {
+        doc.span = input.span_from_checkpoint(&_start).into();
+    }
+
+    Ok(doc)
 }
 
 pub fn string(input: &mut TokenStream<'_>) -> PResult<String> {
     dispatch! {peek_kind;
         IdentString => any.take().map(From::from),
-        QuotedString => cut_err(any.take().and_then(parse_quoted_string)),
-        RawQuotedString => any.take().map(From::from),
-        RawMultiString => any.take().map(From::from),
+        QuotedString => any.take().subtoken_parse(parse_quoted_string),
+        // RawQuotedString => any.take().map(From::from),
+        // RawMultiString => any.take().map(From::from),
         _ => fail,
     }
     .parse_next(input)
@@ -745,54 +865,96 @@ impl Accumulate<Option<char>> for OptCharAcc {
     }
 }
 
-fn parse_quoted_string(input: &mut &str) -> PResult<String> {
+fn parse_quoted_string(input: &str) -> Result<String, Vec<KdlParseError>> {
+    let bad_eof = |_| cx().msg("TODO: Expected closing quote");
+    let no_esc = |_| cx().msg("TODO: Expected escape character");
+
     let mut cursor = Cursor::new(input);
-    cursor
-        .expect('\"')
-        .ok_or_else(|| ParserError::from_input(&cursor.text()))?;
-    *input = cursor.text();
-    // delimited(
-    //     '\"',
-    //     escaped(none_of('\\').map(Some), '\\', string_escape),
-    //     '\"',
-    // )
-    // .map(OptCharAcc::into)
-    // .parse_next(input)
-    Ok(Default::default())
-}
+    let mut buffer = String::with_capacity(input.len() - 2);
+    // String token would never be lexed without a leading quote
+    assert!(cursor.check('"').is_ok());
 
-fn parse_multi_string(input: &mut &str) -> PResult<String> {
-    delimited(
-        "\"\"\"",
-        escaped(none_of('\\').map(Some), '\\', string_escape),
-        "\"\"\"",
-    )
-    .map(OptCharAcc::into)
-    .parse_next(input)
-}
-
-fn string_escape(input: &mut &str) -> PResult<Option<char>> {
-    dispatch! {any;
-        '\\' => empty.value(Some('\\')),
-        '"' => empty.value(Some('"')),
-        'b' => empty.value(Some('\u{0008}')),
-        'n' => empty. value(Some('\n')),
-        'f' => empty.value(Some('\u{000C}')),
-        'r' => empty.value(Some('\r')),
-        't' => empty.value(Some('\t')),
-        's' => empty.value(Some(' ')),
-        'u' => ('{', take_while(1..=6, AsChar::is_hex_digit), '}')
-            .verify_map(|(_, hex, _)| char::from_u32(u32::from_str_radix(hex, 16).unwrap()))
-            .map(Some),
-        c if NEWLINES_AND_SPACES.contains(c) => {
-            take_while(0.., |c| NEWLINES_AND_SPACES.contains(c)).value(None)
-        },
-        // Invalid escape characters will get errored by the lexer.
-        // TODO: maybe instead send the error here? needs to be
-        // recoverable though.
-        _ => fail,
+    loop {
+        match cursor.char().with_error(bad_eof).fail()? {
+            '"' => break,
+            '\\' => {
+                let start = cursor.position();
+                buffer.push(match cursor.char().with_error(no_esc).fail()? {
+                    // Simple escapes
+                    'b' => '\u{0008}',
+                    'n' => '\n',
+                    'f' => '\u{000C}',
+                    'r' => '\r',
+                    't' => '\t',
+                    's' => ' ',
+                    '\\' => '\\',
+                    '"' => '"',
+                    // Unicode escaping
+                    'u' => match parse_unicode_escape(&mut cursor) {
+                        Some(c) => c,
+                        None => continue,
+                    },
+                    // Whitespace escaping
+                    c if NEWLINES_AND_SPACES.contains(c) => {
+                        cursor.eat_while(|c| NEWLINES_AND_SPACES.contains(c));
+                        continue;
+                    }
+                    // Invalid escape character
+                    c => {
+                        cursor.error_from(start, cx().msg("TODO: Invalid escape"));
+                        continue;
+                    }
+                })
+            }
+            c => buffer.push(c),
+        }
     }
-    .parse_next(input)
+
+    cursor.into_errors()?;
+
+    Ok(buffer)
+}
+
+fn parse_unicode_escape(cursor: &mut Cursor<'_>) -> Option<char> {
+    // TODO: Might be useful to organize errors elsewhere?
+    // They can get pretty cluttered when having good heuristics
+    let no_lcur = |_| cx().msg("TODO: Missing {");
+    let no_rcur = |c: Option<char>| match c {
+        Some(c) if c.is_ascii_hexdigit() => {
+            cx().msg("TODO: Unicode escape can only have 6 hex digits")
+        }
+        Some(c) => cx().msg(format_args!("TODO: '{c}' is not a hex digit")),
+        None => cx().msg("TODO: Missing }"),
+    };
+    let bad_char = || cx().msg("TODO: Invalid char representation");
+    let bad_hex = |s: &str| match s.chars().next_back() {
+        Some('}') => cx().msg("TODO: Unicode escape must have at least 1 hex digit"),
+        Some(c) if !c.is_ascii_hexdigit() => {
+            cx().msg(format_args!("TODO: '{c}' is not a hex digit"))
+        }
+        _ => panic!(),
+    };
+
+    cursor.check('{').with_error(no_lcur).pass().ok()?;
+    // Should this variable be inlined?
+    let hex_start = cursor.position();
+    let hex = cursor
+        .eat_while_range(1..=6, |c| char::is_ascii_hexdigit(&c))
+        .with_error(bad_hex)
+        .pass()
+        .ok()?;
+    // While breaking here will not eat the trailing },
+    // it doesn't really matter considering the string will
+    // not be converted into a real value
+    let hex_end = cursor.position();
+
+    cursor.check('}').with_error(no_rcur).pass().ok()?;
+
+    // Is this too weird?
+    char::from_u32(u32::from_str_radix(hex, 16).unwrap()).or_else(|| {
+        cursor.error_range(hex_start, hex_end, bad_char());
+        None
+    })
 }
 
 pub fn line_spaces(input: &mut TokenStream<'_>) -> PResult<()> {
