@@ -328,16 +328,14 @@ impl<'src> Offset<Checkpoint<'src>> for TokenStream<'src> {
     }
 }
 
-static NEWLINES: [&str; 8] = [
-    "\u{000D}\u{000A}",
-    "\u{000D}",
-    "\u{000A}",
-    "\u{0085}",
-    "\u{000B}",
-    "\u{000C}",
-    "\u{2028}",
-    "\u{2029}",
-];
+// TODO: Don't love the repetition here, but concat can't join two constants.
+static NEWLINES: &str = "\u{000D}\u{000A}\u{0085}\u{000B}\u{000C}\u{2028}\u{2029}";
+
+static SPACES: &str = concat!(
+    "\u{0009}\u{0020}\u{00A0}\u{1680}\u{2000}\u{2001}\u{2002}\u{2003}",
+    "\u{2004}\u{2005}\u{2006}\u{2007}\u{2008}\u{2009}\u{200A}\u{202F}",
+    "\u{205F}\u{3000}",
+);
 
 static NEWLINES_AND_SPACES: &str = concat!(
     "\u{0009}\u{0020}\u{00A0}\u{1680}\u{2000}\u{2001}\u{2002}\u{2003}",
@@ -416,6 +414,27 @@ pub fn document(input: &mut TokenStream<'_>) -> PResult<KdlDocument> {
 
 #[test]
 fn idk() -> miette::Result<()> {
+//     let meow = r###"
+//     """
+//     hello
+//     meow
+//         wah
+// xd    """
+// "###;
+//     let val =
+//         parse_multiline_string(meow.trim()).map_err(|errs| failure_from_errs(errs, meow.trim()))?;
+//     println!("{}", val);
+
+    let meow = r###"
+    ##"""hello\"r"""""#
+"###;
+    let val =
+        parse_raw_quoted_string(meow.trim()).map_err(|errs| failure_from_errs(errs, meow.trim()))?;
+    println!("{}", val);
+
+    return Ok(());
+    // todo!();
+
     let text = r#""aa\u{}\u{q}\u{D800}\u{1234567}\ { test; test }"#;
     let mut start = 0;
     let mut tk = |kind: TokenKind, len: usize| {
@@ -840,29 +859,12 @@ pub fn string(input: &mut TokenStream<'_>) -> PResult<String> {
     dispatch! {peek_kind;
         IdentString => any.take().map(From::from),
         QuotedString => any.take().subtoken_parse(parse_quoted_string),
-        // RawQuotedString => any.take().map(From::from),
-        // RawMultiString => any.take().map(From::from),
+        MultiString => any.take().subtoken_parse(parse_multiline_string),
+        RawQuotedString => any.take().subtoken_parse(parse_raw_quoted_string),
+        RawMultiString => any.take().subtoken_parse(parse_raw_multiline_string),
         _ => fail,
     }
     .parse_next(input)
-}
-
-struct OptCharAcc(String);
-impl From<OptCharAcc> for String {
-    fn from(value: OptCharAcc) -> Self {
-        value.0
-    }
-}
-impl Accumulate<Option<char>> for OptCharAcc {
-    fn initial(capacity: Option<usize>) -> Self {
-        OptCharAcc(capacity.map(String::with_capacity).unwrap_or_default())
-    }
-
-    fn accumulate(&mut self, acc: Option<char>) {
-        if let Some(c) = acc {
-            self.0.push(c);
-        }
-    }
 }
 
 fn parse_quoted_string(input: &str) -> Result<String, Vec<KdlParseError>> {
@@ -915,6 +917,161 @@ fn parse_quoted_string(input: &str) -> Result<String, Vec<KdlParseError>> {
     Ok(buffer)
 }
 
+fn parse_raw_quoted_string(input: &str) -> Result<String, Vec<KdlParseError>> {
+    let hashless_input = input.trim_matches('#');
+    let start_hashes = hashless_input.as_ptr().addr() - input.as_ptr().addr();
+    let end_hashes = input.len() - hashless_input.len() - start_hashes;
+
+    println!("{} {}", start_hashes, end_hashes);
+
+    let mut cursor = Cursor::new(&input[..(input.len() - end_hashes - 3)]);
+
+    if start_hashes != end_hashes {
+        cursor.add_raw_error(KdlParseError::from_span_and_ctx(
+            (0..start_hashes).into(),
+            cx().msg("TODO: Unbalanced hashes"),
+        ));
+    }
+    if !hashless_input.ends_with("\"\"\"") {
+        return Err(vec![KdlParseError {
+            span: Some((0..(start_hashes + 3)).into()),
+            message: Some("TODO: Unclosed raw string".into()),
+            ..Default::default()
+        }]);
+    }
+    // Move past the hashes + 3 quotes (these always get lexed correctly)
+    cursor.advance(start_hashes + 3);
+
+    let text = cursor.text();
+
+    cursor.into_errors()?;
+
+    Ok(text.into())
+}
+
+// Pretty sure this is correct, but the function is really complicated
+fn parse_multiline_string(input: &str) -> Result<String, Vec<KdlParseError>> {
+    let no_esc = |_| cx().msg("TODO: Expected escape character");
+    let no_nl = |_| cx().msg("TODO: Multiline string must start with a newline");
+    let bad_dedent = |_| cx().msg("TODO: Dedent error");
+    // Do the initial unterminated string check. These tokens consumes basically
+    // everything in their path, so most other errors will be nonsense.
+    // The ending isn't very interesting as well, so just span it to the initial 3 quotes.
+    // TODO: Maybe add another diagnostic with some help showing the end?
+    if !input.ends_with("\"\"\"") {
+        return Err(vec![KdlParseError {
+            span: Some((0..3).into()),
+            message: Some("TODO: Unclosed multiline string".into()),
+            ..Default::default()
+        }]);
+    }
+
+    // Just strip out the final quotes from the cursor because we already checked it.
+    // The same can't be done for the initial part because of error spanning.
+    let mut cursor = Cursor::new(&input[..(input.len() - 3)]);
+    // TODO: Maybe don't bother with capacity? These strings are likely
+    // to be significantly smaller than their actual token lengths.
+    let mut buffer = String::with_capacity(input.len() - 6);
+    // Two double quotes would just get lexed as an empty string,
+    // and given that its a valid token heuristics can't be done.
+    // Hence, this token is guaranteed to start with the 3 quotes.
+    cursor.advance(3);
+
+    /// A multiline string needs to start with a newline after the quotes,
+    /// but its not "fatal" if it doesn't.
+    let init_nl = cursor
+        .check_fn(|c| NEWLINES.contains(c))
+        .with_error(no_nl)
+        .pass();
+    if init_nl == Ok('\r') && cursor.peek() == Some('\n') {
+        cursor.eat();
+    }
+
+    // First we need to scan for the ending whitespace. If an invalid dedent is found,
+    // just pretend there is no dedent so its possible to collect errors from the rest
+    // of the string.
+    let dedent = get_dedent_whitespace(&input[3..(input.len() - 3)]).unwrap_or_else(|mut err| {
+        // An error with the initial newlines will cause a dedent error, but
+        // that error is a bit more cryptic so no point in pushing it.
+        if init_nl.is_err() {
+            return "";
+        }
+        err.span = err.span.map(|v| (v.offset() + 3, v.len()).into());
+        cursor.add_raw_error(err);
+        ""
+    });
+
+    // The start of this loop is now in the context of a new line.
+    while !cursor.eof() {
+        let buffer_line_start = buffer.len();
+        let mut only_whitespace = true;
+        // Save the dedent error for later so it can be added only if this is not
+        // a blank line
+        let dedent_result = cursor.check_str(dedent).inner();
+
+        while let Some(c) = cursor.eat() {
+            match c {
+                '\\' => {
+                    only_whitespace = false;
+                    let start = cursor.position();
+                    buffer.push(match cursor.char().with_error(no_esc).fail()? {
+                        // Simple escapes
+                        'b' => '\u{0008}',
+                        'n' => '\n',
+                        'f' => '\u{000C}',
+                        'r' => '\r',
+                        't' => '\t',
+                        's' => ' ',
+                        '\\' => '\\',
+                        '"' => '"',
+                        // Unicode escaping
+                        'u' => match parse_unicode_escape(&mut cursor) {
+                            Some(c) => c,
+                            None => continue,
+                        },
+                        // Whitespace escaping
+                        c if NEWLINES_AND_SPACES.contains(c) => {
+                            let res = cursor.eat_while(|c| NEWLINES_AND_SPACES.contains(c));
+                            eprintln!("ough {:?}", format!("{}{}", c, res));
+                            continue;
+                        }
+                        // Invalid escape character
+                        c => {
+                            cursor.error_from(start, cx().msg("TODO: Invalid escape"));
+                            continue;
+                        }
+                    })
+                }
+                c if NEWLINES.contains(c) => {
+                    buffer.push('\n');
+                    break;
+                }
+                c if SPACES.contains(c) => buffer.push(c),
+                c => {
+                    buffer.push(c);
+                    only_whitespace = false;
+                }
+            }
+        }
+
+        // If only whitespace were read from the line and actual data has been pushed,
+        // clear the line and append a newline.
+        if only_whitespace && buffer.len() > buffer_line_start {
+            buffer.truncate(buffer_line_start);
+            buffer.push('\n');
+        } else if let Err((e, span)) = dedent_result {
+            cursor.add_raw_error(KdlParseError::from_span_and_ctx(span, bad_dedent(e)));
+        }
+    }
+
+    // In every valid multiline string, there is a final newline, so pop that.
+    buffer.pop();
+
+    cursor.into_errors()?;
+
+    Ok(buffer)
+}
+
 fn parse_unicode_escape(cursor: &mut Cursor<'_>) -> Option<char> {
     // TODO: Might be useful to organize errors elsewhere?
     // They can get pretty cluttered when having good heuristics
@@ -955,6 +1112,181 @@ fn parse_unicode_escape(cursor: &mut Cursor<'_>) -> Option<char> {
         cursor.error_range(hex_start, hex_end, bad_char());
         None
     })
+}
+
+// Really convoluted function, but I'm 99% sure its *actually* spec compliant. Even the playground
+// (at the time of writing) isn't totally spec compliant when dealing with some convoluted inputs.
+fn get_dedent_whitespace(input: &str) -> Result<&str, KdlParseError> {
+    // The input already has the quotes stripped.
+    let mut chars = input[..].char_indices();
+
+    let mut end_idx = input.len();
+    let mut nl_idx = None;
+    // `err_idx` is the index *after* the character the loop breaks on and can be used as an error
+    // end location.
+    let err_idx = loop {
+        // Move to the first non-space character. If there is no remaining non-space character,
+        // it means the start of the string was reached.
+        let Some((idx, ch)) = chars.rfind(|v| !SPACES.contains(v.1)) else {
+            break 0;
+        };
+        match ch {
+            // This whitespace is maybe being ws escaped. We'll need to count
+            // the number of consecutive backslashes to be sure.
+            '\\' => {
+                let mut count = 1;
+                for (_, c) in chars.clone().rev() {
+                    if c != '\\' {
+                        break;
+                    }
+                    count += 1;
+                }
+
+                // If an even number of consecutive backslashes were found,
+                // this is not actually a whitespace escape, and instead a bunch
+                // backslashes and someone trying to limit test the parser.
+                if count % 2 == 0 {
+                    break idx + ch.len_utf8();
+                }
+                // This was a ws escape, so clear the found newline and reset the
+                // end index.
+                nl_idx = None;
+                end_idx = idx;
+
+                if count > 1 {
+                    // This was a bunch of escapes *followed* by a ws escape. This construct
+                    // is never valid, so just clear nl_idx and break from the loop.
+                    // Also advance the char iterator to simulate finding the next
+                    // non-special character.
+                    break chars
+                        .next_back()
+                        .map(|(i, c)| i + c.len_utf8())
+                        .unwrap_or(0);
+                }
+            }
+            // If we found a newline, mark the important newline. Note that because this scans
+            // backwards, \r\n newlines will get marked on the \n, which is correct.
+            c if NEWLINES.contains(c) => {
+                nl_idx = nl_idx.or(Some(idx));
+            }
+            // Otherwise, we found a non-whitespace character that cannot be a ws escape.
+            _ => break idx + ch.len_utf8(),
+        }
+    };
+
+    let Some(nl_idx) = nl_idx else {
+        let line_start_idx = chars
+            .rfind(|(_, c)| NEWLINES.contains(*c))
+            .map(|(i, c)| i + c.len_utf8())
+            .unwrap_or(0);
+        // No valid newline index was found, which means no dedent whitespace exists.
+        return Err(KdlParseError::from_span_and_ctx(
+            (line_start_idx..err_idx).into(),
+            cx().msg("The last line must be only whitespace"),
+        ));
+    };
+
+    Ok(&input[(nl_idx + 1)..end_idx])
+}
+
+fn parse_raw_multiline_string(input: &str) -> Result<String, Vec<KdlParseError>> {
+    let no_nl = |_| cx().msg("TODO: Multiline string must start with a newline");
+    let bad_dedent = |_| cx().msg("TODO: Dedent error");
+    // This kinda sucks
+    let hashless_input = input.trim_matches('#');
+    let start_hashes = hashless_input.as_ptr().addr() - input.as_ptr().addr();
+    let end_hashes = input.len() - hashless_input.len() - start_hashes;
+
+    let mut cursor = Cursor::new(&input[..(input.len() - end_hashes - 3)]);
+
+    if start_hashes != end_hashes {
+        cursor.add_raw_error(KdlParseError::from_span_and_ctx(
+            (0..start_hashes).into(),
+            cx().msg("TODO: Unbalanced hashes"),
+        ));
+    }
+    if !hashless_input.ends_with("\"\"\"") {
+        return Err(vec![KdlParseError {
+            span: Some((0..(start_hashes + 3)).into()),
+            message: Some("TODO: Unclosed multiline string".into()),
+            ..Default::default()
+        }]);
+    }
+
+    let mut buffer = String::with_capacity(hashless_input.len() - 6);
+    // Move past the hashes + 3 quotes (these always get lexed correctly)
+    cursor.advance(start_hashes + 3);
+    // Check for the starting newline
+    let init_nl = cursor
+        .check_fn(|c| NEWLINES.contains(c))
+        .with_error(no_nl)
+        .pass();
+    if init_nl == Ok('\r') && cursor.peek() == Some('\n') {
+        cursor.eat();
+    }
+
+    let dedent = get_raw_dedent_whitespace(&hashless_input[3..(hashless_input.len() - 3)])
+        .unwrap_or_else(|mut err| {
+            // An error with the initial newlines will cause a dedent error, but
+            // that error is a bit more cryptic so no point in pushing it.
+            if init_nl.is_err() {
+                return "";
+            }
+            err.span = err
+                .span
+                .map(|v| (v.offset() + start_hashes + 3, v.len()).into());
+            cursor.add_raw_error(err);
+            ""
+        });
+
+    while !cursor.eof() {
+        let buffer_line_start = buffer.len();
+        let mut only_whitespace = true;
+        let dedent_result = cursor.check_str(dedent).inner();
+
+        while let Some(c) = cursor.eat() {
+            if NEWLINES.contains(c) {
+                buffer.push('\n');
+                break;
+            } else if !SPACES.contains(c) {
+                only_whitespace = false;
+            }
+            buffer.push(c);
+        }
+
+        if only_whitespace && buffer.len() > buffer_line_start {
+            buffer.truncate(buffer_line_start);
+            buffer.push('\n');
+        } else if let Err((e, span)) = dedent_result {
+            cursor.add_raw_error(KdlParseError::from_span_and_ctx(span, bad_dedent(e)));
+        }
+    }
+
+    buffer.pop();
+    cursor.into_errors()?;
+
+    Ok(buffer)
+}
+
+// Much simpler
+fn get_raw_dedent_whitespace(input: &str) -> Result<&str, KdlParseError> {
+    // The input already has the quotes stripped.
+    let mut chars = input[..].char_indices();
+
+    let (idx, c) = chars.rfind(|v| !SPACES.contains(v.1)).unwrap_or((0, '\0'));
+    if !NEWLINES.contains(c) {
+        let line_start_idx = chars
+            .rfind(|(_, c)| NEWLINES.contains(*c))
+            .map(|(i, c)| i + c.len_utf8())
+            .unwrap_or(0);
+
+        return Err(KdlParseError::from_span_and_ctx(
+            (line_start_idx..(idx + c.len_utf8())).into(),
+            cx().msg("The last line must be only whitespace"),
+        ));
+    }
+
+    Ok(&input[(idx + c.len_utf8())..])
 }
 
 pub fn line_spaces(input: &mut TokenStream<'_>) -> PResult<()> {

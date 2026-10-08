@@ -29,18 +29,15 @@ impl<'t> Cursor<'t> {
     }
     /// Creates an `Ok` action context.
     fn ctx_ok<S, F>(&mut self, val: S) -> ActionContext<'_, 't, S, F> {
-        self.ctx_res(Ok(val))
+        ActionContext::new_ok(self, val)
     }
     /// Creates an `Err` action context.
-    fn ctx_err<S, F>(&mut self, val: F) -> ActionContext<'_, 't, S, F> {
-        self.ctx_res(Err(val))
-    }
-    /// Creates an action context.
-    fn ctx_res<S, F>(&mut self, result: Result<S, F>) -> ActionContext<'_, 't, S, F> {
-        ActionContext {
-            cursor: self,
-            result,
-        }
+    fn ctx_err<S, F>(
+        &mut self,
+        val: F,
+        span: impl Into<SourceSpan>,
+    ) -> ActionContext<'_, 't, S, F> {
+        ActionContext::new_err(self, val, span.into())
     }
     /// Returns the stream's current [`position`].
     ///
@@ -84,13 +81,14 @@ impl<'t> Cursor<'t> {
     /// Eat the string `s` from the stream, returning an error if it does not eat it.
     /// The error will contain the leading characters with a length corresponding
     /// to the length of `s` (or up until EOF).
-    pub(super) fn check_str(&mut self, s: &str) -> ActionContext<'_, 't, (), &str> {
+    pub(super) fn check_str(&mut self, s: &str) -> ActionContext<'_, 't, (), &'t str> {
         if self.text().starts_with(s) {
             self.chars = self.text()[s.len()..].chars();
             self.ctx_ok(())
         } else {
             let text = self.text();
-            self.ctx_err(&text[..(s.len().min(text.len()))])
+            let len = s.len().min(text.len());
+            self.ctx_err(&text[..len], (self.offset(), len))
         }
     }
     /// Eat the character `c` from the stream, returning an error if it does not have it.
@@ -100,12 +98,32 @@ impl<'t> Cursor<'t> {
             self.eat();
             self.ctx_ok(())
         } else {
-            self.ctx_err(self.peek())
+            let c = self.peek();
+            self.ctx_err(c, (self.offset(), c.is_some() as usize))
+        }
+    }
+
+    pub(super) fn check_fn(
+        &mut self,
+        f: impl FnOnce(char) -> bool,
+    ) -> ActionContext<'_, 't, char, Option<char>> {
+        if let Some(c) = self.peek().filter(|v| f(*v)) {
+            self.eat();
+            self.ctx_ok(c)
+        } else {
+            let c = self.peek();
+            self.ctx_err(c, (self.offset(), c.is_some() as usize))
         }
     }
     /// Returns the text remaining in the stream.
     pub(super) fn text(&self) -> &'t str {
         self.chars.as_str()
+    }
+
+    pub(super) fn advance(&mut self, len: usize) -> &'t str {
+        let text = &self.text()[..len];
+        self.chars = self.text()[len..].chars();
+        text
     }
     /// Returns the next character in the stream, or `None` if EOF was encountered.
     pub(super) fn peek(&self) -> Option<char> {
@@ -119,8 +137,10 @@ impl<'t> Cursor<'t> {
     /// Consumes the next character in the stream and returns it, failing
     /// if EOF was encountered.
     pub(super) fn char(&mut self) -> ActionContext<'_, 't, char, ()> {
-        let res = self.eat().ok_or(());
-        self.ctx_res(res)
+        match self.eat() {
+            Some(c) => self.ctx_ok(c),
+            None => self.ctx_err((), self.offset()),
+        }
     }
     /// Returns `true` if the stream is exhausted.
     pub(super) fn eof(&self) -> bool {
@@ -132,7 +152,7 @@ impl<'t> Cursor<'t> {
         while self.peek().is_some_and(&mut f) {
             self.eat();
         }
-        self.text_from(start)
+        self.text_between(start, self.position())
     }
     /// Eats chars until `c` is found. If `c` does not exist in the input stream,
     /// the entire input will be consumed. Returns
@@ -143,7 +163,7 @@ impl<'t> Cursor<'t> {
         let idx = text.find(c).unwrap_or(text.len());
         self.chars = text[idx..].chars();
 
-        self.text_from(start)
+        self.text_between(start, self.position())
     }
     /// Eats chars that match the predicate `f`, with a maximum of the upper bound of `range`.
     /// If the number of chars eaten is less than the lower bound of `range`, an error
@@ -172,10 +192,15 @@ impl<'t> Cursor<'t> {
         }
 
         if !start_bound.contains(&x) {
-            self.ctx_err(self.text_between(start, self.next_pos(self.position())))
+            let end = self.next_pos(self.position());
+            self.ctx_err(self.text_between(start, self.next_pos(self.position())), start.0..end.0)
         } else {
             self.ctx_ok(self.text_between(start, self.position()))
         }
+    }
+    /// Adds a [`KdlParseError`] to the cursor's error list.
+    pub(super) fn add_raw_error(&mut self, error: KdlParseError) {
+        self.errs.push(error);
     }
     /// Adds an error at the current cursor position with a length of `0`.
     pub(super) fn error(&mut self, cx: KdlParseContext) {
@@ -219,10 +244,24 @@ impl<'t> Cursor<'t> {
 /// error handling utilities.
 pub(super) struct ActionContext<'c, 't, S, F> {
     cursor: &'c mut Cursor<'t>,
-    result: Result<S, F>,
+    result: Result<S, (F, SourceSpan)>,
 }
 
 impl<'c, 't, S, F> ActionContext<'c, 't, S, F> {
+    fn new_ok(cursor: &'c mut Cursor<'t>, val: S) -> Self {
+        Self {
+            cursor,
+            result: Ok(val),
+        }
+    }
+
+    fn new_err(cursor: &'c mut Cursor<'t>, val: F, span: SourceSpan) -> Self {
+        Self {
+            cursor,
+            result: Err((val, span)),
+        }
+    }
+
     /// Returns `true` if this action context succeeded.
     pub(super) fn is_ok(&self) -> bool {
         self.result.is_ok()
@@ -236,8 +275,17 @@ impl<'c, 't, S, F> ActionContext<'c, 't, S, F> {
         self,
         cx: impl FnOnce(F) -> KdlParseContext,
     ) -> ActionContext<'c, 't, S, ()> {
-        let pos = self.cursor.position();
-        self.with_error_at(pos, cx)
+        match self.result {
+            Ok(v) => ActionContext {
+                cursor: self.cursor,
+                result: Ok(v),
+            },
+            Err((e, span)) => {
+                let error = KdlParseError::from_span_and_ctx(span, cx(e));
+                self.cursor.add_raw_error(error);
+                ActionContext::new_err(self.cursor, (), span)
+            }
+        }
     }
     /// Adds an error at `pos` if this action context failed.
     pub(super) fn with_error_at(
@@ -268,12 +316,9 @@ impl<'c, 't, S, F> ActionContext<'c, 't, S, F> {
                 cursor: self.cursor,
                 result: Ok(v),
             },
-            Err(e) => {
+            Err((e, span)) => {
                 self.cursor.error_range(start, end, cx(e));
-                ActionContext {
-                    cursor: self.cursor,
-                    result: Err(()),
-                }
+                ActionContext::new_err(self.cursor, (), span)
             }
         }
     }
@@ -284,6 +329,10 @@ impl<'c, 't, S, F> ActionContext<'c, 't, S, F> {
     }
     /// Recovers the current parse, simply returning the inner result value.
     pub(super) fn pass(self) -> Result<S, F> {
+        self.result.map_err(|(v, _)| v)
+    }
+
+    pub(super) fn inner(self) -> Result<S, (F, SourceSpan)> {
         self.result
     }
 }

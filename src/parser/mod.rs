@@ -136,17 +136,23 @@ pub(crate) struct KdlParseError {
     pub(crate) severity: Option<Severity>,
 }
 
+impl KdlParseError {
+    pub(self) fn from_span_and_ctx(span: SourceSpan, ctx: KdlParseContext) -> Self {
+        Self {
+            message: ctx.message,
+            span: Some(span),
+            label: ctx.label,
+            help: ctx.help,
+            severity: ctx.severity,
+        }
+    }
+}
+
 impl<I: Stream + TextLocation> ParserError<I> for KdlParseError {
     type Inner = Self;
     fn from_input(input: &I) -> Self {
         let span = input.span_from_checkpoint(&input.checkpoint());
-        Self {
-            message: None,
-            span: Some(span.into()),
-            label: None,
-            help: None,
-            severity: None,
-        }
+        Self::from_span_and_ctx(span.into(), cx())
     }
 
     fn append(self, _input: &I, _token_start: &<I as Stream>::Checkpoint) -> Self {
