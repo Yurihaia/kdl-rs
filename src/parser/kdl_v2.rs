@@ -10,11 +10,11 @@ use winnow::{
     combinator::{alt, cut_err, delimited, dispatch, eof, fail, opt, repeat, trace},
     error::{FromRecoverableError, Needed, ParserError},
     stream::{Accumulate, ContainsToken, Location, Offset, Recover, Stream, StreamIsPartial},
-    token::{any, one_of},
+    token::{any, literal, one_of},
 };
 
 use crate::{
-    KdlDocument, KdlEntry, KdlIdentifier, KdlNode, KdlNodeFormat, KdlValue,
+    KdlDocument, KdlEntry, KdlEntryFormat, KdlIdentifier, KdlNode, KdlNodeFormat, KdlValue,
     parser::{
         KdlParseError, PError, PResult, SubtokenParse, TextLocation, TraceExt, cursor::Cursor, cx,
         failure_from_errs,
@@ -45,10 +45,11 @@ pub enum TokenKind {
     RawQuotedString,
     RawMultiString,
 
-    HexNumber,
-    OctNumber,
-    BinNumber,
-    DecNumber,
+    HexInteger,
+    OctInteger,
+    BinInteger,
+    DecInteger,
+    DecFloat,
     Inf,
     NegInf,
     Nan,
@@ -110,6 +111,61 @@ impl<'src> fmt::Debug for Token<'src> {
     }
 }
 
+fn tokenize<'src>(text: &'src str) -> (Vec<Token<'src>>, Vec<KdlParseError>) {
+    let mut cursor = Cursor::new(text);
+    let mut tokens = Vec::new();
+    while let Some(token) = read_token(&mut cursor) {
+        tokens.push(token)
+    }
+    let errors = cursor.into_errors().err().unwrap_or_default();
+    (tokens, errors)
+}
+
+fn read_token<'src>(cursor: &mut Cursor<'src>) -> Option<Token<'src>> {
+    let start = cursor.position();
+    let tk = move |cursor: &mut Cursor<'src>, kind: TokenKind| Token {
+        src: cursor.text_between(start, cursor.position()),
+        kind,
+        error: false,
+    };
+
+    let kind = match cursor.eat()? {
+        ';' => Semicolon,
+        '=' => Equals,
+        '{' => LCurly,
+        '}' => RCurly,
+        '(' => LParen,
+        ')' => RParen,
+        '\\' => Escline,
+        '/' => {
+            if cursor
+                .check('-')
+                .with_error(|_| cx().msg("TODO: Expected slashdash"))
+                .is_ok()
+            {
+                Slashdash
+            } else {
+                Unknown
+            }
+        }
+        '\r' => {
+            cursor.check('\n');
+            Newline
+        }
+        c if NEWLINES.contains(c) => Newline,
+        c if SPACES.contains(c) => {
+            cursor.eat_while(|c| SPACES.contains(c));
+            Space
+        }
+        c if c.is_alphabetic() => {
+            cursor.eat_while(|c| c.is_alphabetic());
+            IdentString
+        }
+        _ => panic!(),
+    };
+    Some(tk(cursor, kind))
+}
+
 impl<'src> Parser<TokenStream<'src>, Token<'src>, PError> for TokenKind {
     fn parse_next(&mut self, input: &mut TokenStream<'src>) -> PResult<Token<'src>> {
         trace(*self, |input: &mut TokenStream<'src>| {
@@ -119,10 +175,6 @@ impl<'src> Parser<TokenStream<'src>, Token<'src>, PError> for TokenKind {
                 .ok_or_else(|| ParserError::from_input(input))
         })
         .parse_next(input)
-        // input
-        //     .next_token()
-        //     .filter(|t| t.kind == *self)
-        //     .ok_or_else(|| ParserError::from_input(input))
     }
 }
 
@@ -414,54 +466,24 @@ pub fn document(input: &mut TokenStream<'_>) -> PResult<KdlDocument> {
 
 #[test]
 fn idk() -> miette::Result<()> {
-//     let meow = r###"
-//     """
-//     hello
-//     meow
-//         wah
-// xd    """
-// "###;
-//     let val =
-//         parse_multiline_string(meow.trim()).map_err(|errs| failure_from_errs(errs, meow.trim()))?;
-//     println!("{}", val);
+    let text = r#"
+yay /-no
+"#
+    .trim_matches('\n');
 
-    let meow = r###"
-    ##"""hello\"r"""""#
-"###;
-    let val =
-        parse_raw_quoted_string(meow.trim()).map_err(|errs| failure_from_errs(errs, meow.trim()))?;
-    println!("{}", val);
+    let (tokens, errors) = tokenize(text);
 
-    return Ok(());
-    // todo!();
+    println!("{:?}", tokens);
 
-    let text = r#""aa\u{}\u{q}\u{D800}\u{1234567}\ { test; test }"#;
-    let mut start = 0;
-    let mut tk = |kind: TokenKind, len: usize| {
-        let span = start..(start + len);
-        start += len;
-        Token::new(kind, text, span)
-    };
-    let tokens = &[
-        tk(QuotedString, 32),
-        tk(Space, 1),
-        tk(LCurly, 1),
-        tk(Space, 1),
-        tk(IdentString, 4),
-        tk(Semicolon, 1),
-        tk(Space, 1),
-        tk(IdentString, 4),
-        tk(Space, 1),
-        tk(RCurly, 1),
-    ];
-    let mut stream = TokenStream::new(tokens, text);
+    let mut stream = TokenStream::new(&tokens, text);
+    stream.errors.extend(errors);
     let document = match document.parse_next(&mut stream) {
         Ok(d) => d,
         Err(e) => {
             return Err(failure_from_errs(stream.errors, text).into());
         }
     };
-    println!("{:?}", document.nodes[0].name.value());
+    println!("{:?}", document);
     println!("\ndocument:\n{}\n\noriginal:\n{}\n", document, text);
 
     Ok(())
@@ -741,9 +763,88 @@ where
 }
 
 pub fn entry(input: &mut TokenStream<'_>) -> PResult<KdlEntry> {
-    let mut value = KdlEntry::new(KdlValue::Null);
-    value.format = Some(Default::default());
-    Null.value(value).parse_next(input)
+    alt((
+        (
+            identifier.with_taken(),
+            opt((
+                node_space0.take(),
+                Equals,
+                node_space0.take(),
+                opt((annotation, node_space0.take())),
+                cut_err(value.with_taken()),
+            )),
+        )
+            .with_span()
+            .map(|((ident, val), _span)| {
+                if let Some((after_key, _, after_eq, ty, val)) = val {
+                    let (before_ty_name, ty, after_ty_name, after_ty) = ty
+                        .map(|((b, i, a), at)| (b, Some(i), a, at))
+                        .unwrap_or_default();
+                    KdlEntry {
+                        name: Some(ident.0),
+                        ty,
+                        value: val.0,
+                        format: Some(KdlEntryFormat {
+                            after_key: after_key.into(),
+                            before_ty_name: before_ty_name.into(),
+                            after_ty_name: after_ty_name.into(),
+                            after_ty: after_ty.into(),
+                            after_eq: after_eq.into(),
+                            value_repr: val.1.into(),
+                            ..Default::default()
+                        }),
+                        #[cfg(feature = "span")]
+                        span: _span.into(),
+                    }
+                } else {
+                    KdlEntry {
+                        name: None,
+                        ty: None,
+                        value: KdlValue::String(ident.0.value),
+                        format: Some(KdlEntryFormat {
+                            value_repr: ident.1.into(),
+                            ..Default::default()
+                        }),
+                        #[cfg(feature = "span")]
+                        span: _span.into(),
+                    }
+                }
+            }),
+        (opt((annotation, node_space0.take())), value.with_taken())
+            .with_span()
+            .map(|((ty, val), _span)| {
+                let (before_ty_name, ty, after_ty_name, after_ty) = ty
+                    .map(|((b, i, a), at)| (b, Some(i), a, at))
+                    .unwrap_or_default();
+                KdlEntry {
+                    name: None,
+                    ty,
+                    value: val.0,
+                    format: Some(KdlEntryFormat {
+                        before_ty_name: before_ty_name.into(),
+                        after_ty_name: after_ty_name.into(),
+                        after_ty: after_ty.into(),
+                        value_repr: val.1.into(),
+                        ..Default::default()
+                    }),
+                    #[cfg(feature = "span")]
+                    span: _span.into(),
+                }
+            }),
+    ))
+    .trace("entry")
+    .parse_next(input)
+}
+
+pub fn value(input: &mut TokenStream<'_>) -> PResult<KdlValue> {
+    alt((
+        string.map(KdlValue::String),
+        number,
+        True.map(|_| KdlValue::Bool(true)),
+        False.map(|_| KdlValue::Bool(false)),
+        Null.map(|_| KdlValue::Null),
+    ))
+    .parse_next(input)
 }
 
 pub struct KdlChildrenAcc {
@@ -853,6 +954,50 @@ pub fn braced_child_nodes(input: &mut TokenStream<'_>) -> PResult<KdlDocument> {
     }
 
     Ok(doc)
+}
+
+pub fn number(input: &mut TokenStream<'_>) -> PResult<KdlValue> {
+    let parse_nondec_number = |base: u32| {
+        move |input: &str| {
+            let mut cursor = Cursor::new(input);
+            let neg = cursor
+                .check_fn(|c| c == '-' || c == '+')
+                .pass()
+                .is_ok_and(|c| c == '-');
+            // The lexer uses the 0xob tags to determine what token this is,
+            // so it can just be skipped safely.
+            cursor.eat();
+            cursor.eat();
+            i128::from_str_radix(&cursor.text().replace('_', ""), base)
+                .map(|v| if neg { -v } else { v })
+                .map(KdlValue::Integer)
+        }
+    };
+
+    match peek_kind.parse_next(input)? {
+        Nan => any.map(|_| KdlValue::Float(f64::NAN)).parse_next(input),
+        NegInf => any
+            .map(|_| KdlValue::Float(f64::NEG_INFINITY))
+            .parse_next(input),
+        Inf => any
+            .map(|_| KdlValue::Float(f64::INFINITY))
+            .parse_next(input),
+        HexInteger => any
+            .take()
+            .try_map(parse_nondec_number(16))
+            .parse_next(input),
+        OctInteger => any.take().try_map(parse_nondec_number(8)).parse_next(input),
+        BinInteger => any.take().try_map(parse_nondec_number(2)).parse_next(input),
+        DecInteger => any
+            .take()
+            .try_map(|input: &str| input.replace('_', "").parse().map(KdlValue::Integer))
+            .parse_next(input),
+        DecFloat => any
+            .take()
+            .try_map(|input: &str| input.replace('_', "").parse().map(KdlValue::Float))
+            .parse_next(input),
+        _ => fail.parse_next(input),
+    }
 }
 
 pub fn string(input: &mut TokenStream<'_>) -> PResult<String> {
